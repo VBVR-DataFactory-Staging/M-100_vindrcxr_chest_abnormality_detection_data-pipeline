@@ -1,38 +1,25 @@
-"""Pipeline configuration for M-043 (ddr_lesion_bbox_detection)."""
+"""Pipeline configuration for M-100 VinDr-CXR chest abnormality detection."""
 from pathlib import Path
 from pydantic import Field
 from core.pipeline import PipelineConfig
 
 
 class TaskConfig(PipelineConfig):
-    """Configuration for M-043 pipeline.
-
-    Inherited from PipelineConfig:
-        num_samples: Optional[int]  # Max samples (None = all)
-        domain: str
-        output_dir: Path
-        split: str
-    """
+    """Dataset + rendering settings for VinDr-CXR chest X-ray bbox detection."""
 
     domain: str = Field(default="vindrcxr_chest_abnormality_detection")
+    generator: str = Field(default="")
 
-    s3_bucket: str = Field(
-        default="med-vr-datasets",
-        description="S3 bucket containing the raw M-043 data",
-    )
-    s3_prefix: str = Field(
-        default="M-100_VinDr-CXR/raw/",
-        description="S3 key prefix for the dataset raw data",
-    )
-    fps: int = Field(
-        default=3,
-        description="Frames per second for the generated videos",
-    )
-    raw_dir: Path = Field(
-        default=Path("raw"),
-        description="Local directory for downloaded raw data",
-    )
-    task_prompt: str = Field(
-        default="This chest X-ray. Detect and draw bounding boxes around thoracic abnormalities from VinDr-CXR's 22 disease classes (Aortic enlargement, Cardiomegaly, Pleural effusion, etc.).",
-        description="The task instruction shown to the reasoning model.",
-    )
+    # Raw data location (populated by onramp pull-to-s3 → S3, cached locally by downloader)
+    s3_bucket: str = Field(default="med-vr-datasets")
+    s3_prefix: str = Field(default="M-100/VinDrCXR/")
+    raw_dir: Path = Field(default=Path("raw"))
+
+    # Rendering
+    fps: int = Field(default=8, ge=1)
+    num_frames: int = Field(default=20, ge=2)
+    width: int = Field(default=640, ge=64)
+    height: int = Field(default=640, ge=64)
+
+    # Cap at 2000 samples by default per the M-100 spec.
+    max_samples: int = Field(default=2000, ge=1)

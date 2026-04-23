@@ -1,55 +1,83 @@
-"""Task pipeline for M-043.
+"""M-100 VinDr-CXR chest abnormality detection pipeline."""
+from __future__ import annotations
 
-This module is a thin wrapper that delegates all real work to the vendored
-phase2 logic in ``src/pipeline/_phase2/m042_044_ddr.py``. The phase2 module
-generates the standard 7-file task layout into
-``datasets/_example_output/M-043_ddr_lesion_bbox_detection/`` relative to the pipeline's
-``DATA_ROOT``.
-
-The :class:`TaskPipeline` class below exposes the standard Med-VR
-BasePipeline interface (download + process_sample + run) so it stays
-compatible with the wider harness.
-"""
 from pathlib import Path
 from typing import Iterator, Optional
-import sys
 
-from core.pipeline import BasePipeline, TaskSample
-from src.download.downloader import create_downloader
-from src.pipeline.config import TaskConfig
+from core.pipeline import BasePipeline, SampleProcessor, TaskSample
+from core.download import run_download
 
-# Make the vendored phase2 code importable.
-_PHASE2 = Path(__file__).parent / "_phase2"
-if str(_PHASE2) not in sys.path:
-    sys.path.insert(0, str(_PHASE2))
+from .config import TaskConfig
+from .transforms import build_sample_videos, read_yolo_labels, PROMPT_CLASSES
 
-import importlib
-_phase2_mod = importlib.import_module("m042_044_ddr")
+
+PROMPT = (
+    "Identify all abnormalities in the final chest X-ray. 14 classes each with "
+    "a distinct color bounding box: "
+    + ", ".join(PROMPT_CLASSES)
+    + ". Answer which classes are present."
+)
 
 
 class TaskPipeline(BasePipeline):
+    """VinDr-CXR bbox detection pipeline: CXR + YOLO labels -> first/last/gt videos."""
 
-    def __init__(self, config: Optional[TaskConfig] = None):
-        super().__init__(config or TaskConfig())
-        self.downloader = create_downloader(self.config)
+    def __init__(self, config: TaskConfig):
+        super().__init__(config)
+        self.task_config = config
 
     def download(self) -> Iterator[dict]:
-        yield from self.downloader.iter_samples(limit=self.config.num_samples)
+        yield from run_download(self.task_config)
 
     def process_sample(self, raw_sample: dict, idx: int) -> Optional[TaskSample]:
-        """Delegate processing to the vendored phase2 ``main()``.
+        cfg = self.task_config
+        global_idx = int(getattr(cfg, "start_index", 0)) + idx
+        task_id = f"{cfg.domain}_{global_idx:08d}"
 
-        Calls phase2 main() once on first sample; subsequent invocations
-        are no-ops since phase2 writes the full output in one pass.
-        """
-        if idx > 0:
-            return None  # phase2 main() is invoked once
-        if hasattr(_phase2_mod, "main"):
-            _phase2_mod.main()
-        return None  # phase2 writes files directly, no TaskSample returned
+        image_path = raw_sample.get("image_path")
+        label_path = raw_sample.get("label_path")
+        if not image_path:
+            return None
 
-    def run(self):
-        # Override BasePipeline.run to just call phase2.main() directly.
-        if hasattr(_phase2_mod, "main"):
-            _phase2_mod.main()
-        return []
+        labels = read_yolo_labels(label_path)
+
+        tmp_out = Path("_tmp") / task_id
+        try:
+            media = build_sample_videos(
+                image_path=image_path,
+                labels=labels,
+                task_id=task_id,
+                out_dir=tmp_out,
+                width=cfg.width,
+                height=cfg.height,
+                fps=cfg.fps,
+                num_frames=cfg.num_frames,
+            )
+        except FileNotFoundError as exc:
+            print(f"  [skip] {task_id}: {exc}", flush=True)
+            return None
+
+        return SampleProcessor.build_sample(
+            task_id=task_id,
+            domain=cfg.domain,
+            first_image=media["first_frame"],
+            prompt=PROMPT,
+            final_image=media["final_frame"],
+            first_video=media["first_video"],
+            last_video=media["last_video"],
+            ground_truth_video=media["ground_truth_video"],
+            metadata={
+                "dataset": raw_sample.get("dataset", "VinDr-CXR"),
+                "source_id": raw_sample.get("source_id"),
+                "split": raw_sample.get("split"),
+                "num_boxes": media["num_boxes"],
+                "present_classes": media["present_classes"],
+                "boxes": media["boxes"],
+                "video_spec": {
+                    "fps": cfg.fps,
+                    "num_frames": cfg.num_frames,
+                    "width": cfg.width,
+                    "height": cfg.height,
+                },
+            },
+        )
