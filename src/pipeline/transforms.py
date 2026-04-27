@@ -1,327 +1,322 @@
-"""Rendering utilities for M-100 VinDr-CXR bbox detection videos.
+"""Transforms for M-100 INSPECT pulmonary embolism multimodal pipeline.
 
-Builds three clips per sample:
-  - first_video: 20-frame slow-zoom of the chest X-ray, no overlay
-  - last_video:  same zoom stack + per-class colored bbox + class label text
-  - ground_truth: raw -> (fade in bboxes) -> fully annotated
+Pipeline = CT volume + radiology impression text → axial sweep video (+ side panel).
 
-Plus first_frame.png (raw) and final_frame.png (annotated) keyframes.
+Rendering contract:
 
-YOLO label format on disk (normalized [0,1]): "cls cx cy w h".
+    frame = [ CT_axial_slice (square)  ||  Clinical text panel ]
+
+    first_video        = axial sweep through the PE region, NO highlight.
+    last_video         = same sweep with red mask (40% opacity) on PE-likely
+                         regions (PE-positive only) + reveal banner in side panel.
+    ground_truth_video = same as last_video.
+
+PE-region detection is heuristic — INSPECT does not ship per-voxel masks.
+We use HU thresholds that pick out contrast-enhanced pulmonary arteries inside
+a central-chest ROI, and visualise them in red on PE-positive studies.
 """
 from __future__ import annotations
 
+import re
 import subprocess
-import tempfile
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
-# 22 VinDr-CXR classes (matches data.yaml in Benxelua/vindr-png-yolo-rescale).
-VINDR_CLASSES: List[str] = [
-    "Aortic enlargement",     # 0
-    "Atelectasis",            # 1
-    "Calcification",          # 2
-    "Cardiomegaly",           # 3
-    "Clavicle fracture",      # 4
-    "Consolidation",          # 5
-    "Edema",                  # 6
-    "Emphysema",              # 7
-    "Enlarged PA",            # 8
-    "ILD",                    # 9
-    "Infiltration",           # 10
-    "Lung Opacity",           # 11
-    "Lung cavity",            # 12
-    "Lung cyst",              # 13
-    "Mediastinal shift",      # 14
-    "Nodule/Mass",            # 15
-    "Other lesion",           # 16
-    "Pleural effusion",       # 17
-    "Pleural thickening",     # 18
-    "Pneumothorax",           # 19
-    "Pulmonary fibrosis",     # 20
-    "Rib fracture",           # 21
-]
+# ──────────────────────────────────────────────────────────────────────────────
+#  CT windowing
+# ──────────────────────────────────────────────────────────────────────────────
 
-# 14 classes requested by the M-100 spec — used for the prompt + overlay palette.
-PROMPT_CLASSES: List[str] = [
-    "Aortic enlargement",
-    "Atelectasis",
-    "Calcification",
-    "Cardiomegaly",
-    "Consolidation",
-    "ILD",
-    "Infiltration",
-    "Lung Opacity",
-    "Nodule/Mass",
-    "Other lesion",
-    "Pleural effusion",
-    "Pleural thickening",
-    "Pneumothorax",
-    "Pulmonary fibrosis",
-]
+def window_slice(hu: np.ndarray, wl: int, ww: int) -> np.ndarray:
+    """Apply HU window → uint8 grayscale."""
+    vmin = wl - ww / 2.0
+    vmax = wl + ww / 2.0
+    img = np.clip((hu.astype(np.float32) - vmin) / (vmax - vmin) * 255.0, 0, 255)
+    return img.astype(np.uint8)
 
 
-def _distinct_bgr_palette(n: int) -> List[Tuple[int, int, int]]:
-    """Distinct hues spread evenly on HSV, converted to OpenCV BGR tuples."""
-    palette = []
-    for i in range(n):
-        hue = int(round(179 * i / max(1, n)))
-        hsv = np.uint8([[[hue, 220, 245]]])
-        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
-        palette.append((int(bgr[0]), int(bgr[1]), int(bgr[2])))
-    return palette
+# ──────────────────────────────────────────────────────────────────────────────
+#  Axial-sweep slice selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def pick_sweep_indices(num_slices: int, num_frames: int) -> List[int]:
+    """Pick N evenly-spaced slices from the central ~60% of the volume."""
+    if num_slices <= 0:
+        return []
+    lo = int(num_slices * 0.20)
+    hi = max(lo + 1, int(num_slices * 0.80))
+    hi = min(hi, num_slices)
+    if hi - lo < num_frames:
+        lo, hi = 0, num_slices
+    idxs = np.linspace(lo, hi - 1, num=min(num_frames, hi - lo)).round().astype(int)
+    seen = set()
+    out: List[int] = []
+    for i in idxs:
+        ii = int(i)
+        if ii in seen:
+            continue
+        seen.add(ii)
+        out.append(ii)
+    return out
 
 
-# Colors keyed by *class name* so the same disease always gets the same hue.
-CLASS_COLORS = dict(zip(VINDR_CLASSES, _distinct_bgr_palette(len(VINDR_CLASSES))))
+# ──────────────────────────────────────────────────────────────────────────────
+#  PE mask heuristic (INSPECT has no per-voxel labels)
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-# -----------------------------------------------------------------------------
-# Label I/O
-# -----------------------------------------------------------------------------
-
-def read_yolo_labels(label_path: str | None) -> List[Tuple[int, float, float, float, float]]:
-    """Read a YOLO-format label file. Returns [(cls, cx, cy, w, h), ...] normalized.
-
-    Empty or missing file -> empty list (meaning "no findings").
+def pe_heuristic_mask(hu_slice: np.ndarray) -> np.ndarray:
+    """Heuristic pulmonary-artery highlight: bright (contrast-enhanced)
+    voxels inside a central-chest circular ROI. Returns a bool mask.
     """
-    if not label_path:
-        return []
-    p = Path(label_path)
-    if not p.exists():
-        return []
-    out = []
-    for line in p.read_text().splitlines():
-        parts = line.strip().split()
-        if len(parts) < 5:
-            continue
-        try:
-            cls = int(float(parts[0]))
-            cx, cy, w, h = (float(x) for x in parts[1:5])
-        except ValueError:
-            continue
-        out.append((cls, cx, cy, w, h))
-    return out
+    h, w = hu_slice.shape
+    yy, xx = np.ogrid[:h, :w]
+    cy, cx = h // 2, w // 2
+    radius = min(h, w) * 0.30
+    roi = ((yy - cy) ** 2 + (xx - cx) ** 2) <= (radius ** 2)
+    # PE-protocol CT: contrast-enhanced arteries sit around +80..+400 HU.
+    bright = (hu_slice >= 80) & (hu_slice <= 400)
+    return roi & bright
 
 
-# -----------------------------------------------------------------------------
-# Image / drawing helpers
-# -----------------------------------------------------------------------------
-
-def _load_bgr(image_path: str, size: Tuple[int, int]) -> np.ndarray:
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"Could not open image: {image_path}")
-    return cv2.resize(img, size, interpolation=cv2.INTER_AREA)
-
-
-def _yolo_to_xyxy(
-    cx: float, cy: float, w: float, h: float, W: int, H: int,
-) -> Tuple[int, int, int, int]:
-    x1 = int(round((cx - w / 2) * W))
-    y1 = int(round((cy - h / 2) * H))
-    x2 = int(round((cx + w / 2) * W))
-    y2 = int(round((cy + h / 2) * H))
-    x1 = max(0, min(W - 1, x1))
-    y1 = max(0, min(H - 1, y1))
-    x2 = max(0, min(W - 1, x2))
-    y2 = max(0, min(H - 1, y2))
-    return x1, y1, x2, y2
-
-
-def draw_bboxes(
-    frame_bgr: np.ndarray,
-    labels: Sequence[Tuple[int, float, float, float, float]],
-    *,
-    alpha: float = 1.0,
-    thickness: int = 2,
-    draw_text: bool = True,
+def colorize_ct_slice(
+    hu: np.ndarray,
+    wl: int,
+    ww: int,
+    pe_mask: Optional[np.ndarray] = None,
+    alpha: float = 0.40,
 ) -> np.ndarray:
-    """Draw per-class colored bboxes + label text onto a BGR frame."""
-    H, W = frame_bgr.shape[:2]
-    if not labels:
-        return frame_bgr.copy()
+    """Render CT slice as RGB; overlay PE-likely regions in red (optional)."""
+    gray = window_slice(hu, wl, ww)
+    rgb = np.stack([gray, gray, gray], axis=-1).astype(np.uint8)
 
-    overlay = frame_bgr.copy()
-    for cls, cx, cy, w, h in labels:
-        if not (0 <= cls < len(VINDR_CLASSES)):
-            continue
-        name = VINDR_CLASSES[cls]
-        color = CLASS_COLORS.get(name, (255, 255, 255))
-        x1, y1, x2, y2 = _yolo_to_xyxy(cx, cy, w, h, W, H)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
-        if draw_text:
-            label = name
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            pad = 3
-            bx1, by1 = x1, max(0, y1 - th - 2 * pad)
-            bx2, by2 = x1 + tw + 2 * pad, y1
-            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), color, -1)
-            cv2.putText(
-                overlay, label, (bx1 + pad, by2 - pad),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA,
-            )
+    # Faint blue tint on normal vasculature.
+    vessel_mask = (hu >= 60) & (hu < 80)
+    if vessel_mask.any():
+        blue = np.array([0, 100, 255], dtype=np.float32)
+        base = rgb[vessel_mask].astype(np.float32)
+        rgb[vessel_mask] = (base * 0.85 + blue * 0.15).astype(np.uint8)
 
-    if alpha < 1.0:
-        return cv2.addWeighted(overlay, alpha, frame_bgr, 1.0 - alpha, 0)
-    return overlay
+    if pe_mask is not None and pe_mask.any():
+        red = np.array([255, 0, 0], dtype=np.float32)
+        base = rgb[pe_mask].astype(np.float32)
+        rgb[pe_mask] = (base * (1 - alpha) + red * alpha).astype(np.uint8)
+
+    return rgb
 
 
-def draw_banner(frame_bgr: np.ndarray, text: str) -> np.ndarray:
-    out = frame_bgr.copy()
-    h, w = out.shape[:2]
-    bh = max(30, h // 16)
-    cv2.rectangle(out, (0, h - bh), (w, h), (0, 0, 0), -1)
-    cv2.putText(
-        out, text, (12, h - bh // 3),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA,
-    )
-    return out
+# ──────────────────────────────────────────────────────────────────────────────
+#  Side panel (impression text + label flags)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_FONT_CACHE: dict = {}
 
 
-def zoom_crop(frame_bgr: np.ndarray, progress: float) -> np.ndarray:
-    """Slow zoom-in (1.0 -> 1.12x) keeping output size constant."""
-    zoom = 1.0 + 0.12 * float(np.clip(progress, 0.0, 1.0))
-    h, w = frame_bgr.shape[:2]
-    new_w, new_h = int(w / zoom), int(h / zoom)
-    x0 = (w - new_w) // 2
-    y0 = (h - new_h) // 2
-    crop = frame_bgr[y0:y0 + new_h, x0:x0 + new_w]
-    return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
-# -----------------------------------------------------------------------------
-# Video writer (ffmpeg libx264 with mp4v fallback)
-# -----------------------------------------------------------------------------
-
-def write_mp4(frames: List[np.ndarray], out_path: Path, fps: int) -> Path:
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if not frames:
-        raise ValueError("write_mp4: empty frames list")
-
-    h, w = frames[0].shape[:2]
-    tmp_dir = Path(tempfile.mkdtemp(prefix="vbvr_tmp_mp4_"))
-    try:
-        for i, f in enumerate(frames):
-            cv2.imwrite(str(tmp_dir / f"f_{i:05d}.png"), f)
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-framerate", str(fps),
-            "-i", str(tmp_dir / "f_%05d.png"),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            str(out_path),
-        ]
-        res = subprocess.run(cmd, capture_output=True)
-        if res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
-            return out_path
-    except FileNotFoundError:
-        pass
-    finally:
-        for p in tmp_dir.glob("*"):
+def _load_font(size: int) -> ImageFont.ImageFont:
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for path in candidates:
+        if Path(path).exists():
             try:
-                p.unlink()
-            except OSError:
-                pass
-        try:
-            tmp_dir.rmdir()
-        except OSError:
-            pass
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    vw = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-    try:
-        for f in frames:
-            vw.write(f)
-    finally:
-        vw.release()
-    return out_path
+                font = ImageFont.truetype(path, size)
+                _FONT_CACHE[size] = font
+                return font
+            except Exception:
+                continue
+    font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
 
 
-# -----------------------------------------------------------------------------
-# Sample builder
-# -----------------------------------------------------------------------------
+_NUM_PREFIX = re.compile(r"^\s*\d+\s*[.)]\s*")
 
-def build_sample_videos(
-    image_path: str,
-    labels: Sequence[Tuple[int, float, float, float, float]],
-    task_id: str,
-    out_dir: Path,
-    *,
+
+def _summarize_impression(text: str, max_chars: int = 380) -> str:
+    """Trim very long radiology impressions for side-panel display."""
+    if not text:
+        return "(no impression text)"
+    t = text.strip().strip('"')
+    # Keep first 2-3 numbered findings.
+    parts = re.split(r"\s*\d+\s*[.)]\s*", t)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) >= 2:
+        joined = " · ".join(parts[:3])
+    else:
+        joined = t
+    joined = re.sub(r"\s+", " ", joined)
+    if len(joined) > max_chars:
+        joined = joined[: max_chars - 1] + "…"
+    return joined
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
+    """Greedy word-wrap for the impression paragraph."""
+    words = text.split()
+    if not words:
+        return []
+    lines: List[str] = []
+    line = words[0]
+    for w in words[1:]:
+        cand = line + " " + w
+        bbox = draw.textbbox((0, 0), cand, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            line = cand
+        else:
+            lines.append(line)
+            line = w
+    lines.append(line)
+    return lines
+
+
+def render_ehr_panel(
+    raw: dict,
     width: int,
     height: int,
-    fps: int,
-    num_frames: int,
-) -> dict:
-    """Render three clips + keyframes for one CXR study."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    title: str,
+    reveal: bool = False,
+) -> np.ndarray:
+    """Render a clinical side panel (dark bg, white text) as uint8 RGB."""
+    img = Image.new("RGB", (width, height), (18, 20, 26))
+    draw = ImageDraw.Draw(img)
 
-    size = (int(width), int(height))
-    raw_bgr = _load_bgr(image_path, size)
-    ann_bgr = draw_bboxes(raw_bgr, labels)
+    font_title = _load_font(20)
+    font_label = _load_font(14)
+    font_value = _load_font(14)
+    font_body = _load_font(13)
+    font_small = _load_font(12)
 
-    banner_raw = "Chest X-ray (raw)"
-    banner_anno = "Annotated (per-class bbox + label)"
+    pad = 16
+    y = pad
+    draw.text((pad, y), title, font=font_title, fill=(220, 230, 240))
+    y += 28
+    draw.line((pad, y, width - pad, y), fill=(80, 90, 110), width=1)
+    y += 10
 
-    first_frames, last_frames, gt_frames = [], [], []
-    fade_end = max(1, num_frames // 2)
-    for i in range(num_frames):
-        prog = i / max(1, num_frames - 1)
-        f1 = zoom_crop(raw_bgr, prog)
-        first_frames.append(draw_banner(f1, banner_raw))
-        f2 = zoom_crop(ann_bgr, prog)
-        last_frames.append(draw_banner(f2, banner_anno))
-        if i <= fade_end:
-            a = i / fade_end
-            blended = cv2.addWeighted(raw_bgr, 1.0 - a, ann_bgr, a, 0)
-            lab = "Bbox reveal"
-        else:
-            blended = ann_bgr
-            lab = banner_anno
-        f3 = zoom_crop(blended, prog)
-        gt_frames.append(draw_banner(f3, lab))
+    label_col = pad
+    value_col = pad + 130
 
-    first_video = write_mp4(first_frames, out_dir / f"{task_id}_first.mp4", fps)
-    last_video = write_mp4(last_frames, out_dir / f"{task_id}_last.mp4", fps)
-    gt_video = write_mp4(gt_frames, out_dir / f"{task_id}_gt.mp4", fps)
-
-    first_frame_pil = Image.fromarray(cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB))
-    final_frame_pil = Image.fromarray(cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB))
-
-    H, W = raw_bgr.shape[:2]
-    boxes = []
-    present = set()
-    for cls, cx, cy, w, h in labels:
-        if not (0 <= cls < len(VINDR_CLASSES)):
+    rows: List[Tuple[str, str]] = [
+        ("Patient", f"id={raw.get('person_id', '?') or '?'}"),
+        ("Image ID", str(raw.get("image_id", "?"))),
+        ("Procedure", str(raw.get("procedure_dt", "") or "")[:10] or "—"),
+        ("", ""),
+        ("— Impression —", ""),
+    ]
+    for label, value in rows:
+        if not label and not value:
+            y += 6
             continue
-        name = VINDR_CLASSES[cls]
-        present.add(name)
-        x1, y1, x2, y2 = _yolo_to_xyxy(cx, cy, w, h, W, H)
-        boxes.append({
-            "class_id": cls,
-            "class_name": name,
-            "bbox_xyxy_px": [x1, y1, x2, y2],
-            "bbox_yolo_norm": [round(cx, 6), round(cy, 6), round(w, 6), round(h, 6)],
-        })
+        if label.startswith("—"):
+            draw.text((label_col, y), label, font=font_label, fill=(140, 180, 220))
+        else:
+            draw.text((label_col, y), label, font=font_label, fill=(180, 190, 200))
+            draw.text((value_col, y), value, font=font_value, fill=(240, 245, 250))
+        y += 18
 
-    return {
-        "first_video": str(first_video),
-        "last_video": str(last_video),
-        "ground_truth_video": str(gt_video),
-        "first_frame": first_frame_pil,
-        "final_frame": final_frame_pil,
-        "boxes": boxes,
-        "present_classes": sorted(present),
-        "num_boxes": len(boxes),
-    }
+    body = _summarize_impression(raw.get("impression", ""))
+    body_lines = _wrap_text(draw, body, font_body, width - 2 * pad)
+    # Limit how many lines we draw so we leave room for footer + banner.
+    max_body_lines = max(3, (height - y - 90) // 16)
+    for line in body_lines[:max_body_lines]:
+        draw.text((pad, y), line, font=font_body, fill=(220, 230, 240))
+        y += 16
+
+    # Footer
+    y_foot = height - pad - 40
+    draw.line((pad, y_foot, width - pad, y_foot), fill=(80, 90, 110), width=1)
+    draw.text(
+        (pad, y_foot + 4),
+        "INSPECT  (Stanford AIMI, 2023)",
+        font=font_small,
+        fill=(140, 150, 170),
+    )
+    draw.text(
+        (pad, y_foot + 18),
+        "CTPA + impression → PE yes/no",
+        font=font_small,
+        fill=(140, 150, 170),
+    )
+
+    if reveal:
+        label = int(raw.get("label", 0))
+        pe_acute = int(raw.get("pe_acute", 0))
+        pe_sub = int(raw.get("pe_subseg", 0))
+        if label == 1:
+            banner = (200, 30, 30)
+            tag = "acute" if pe_acute else ("subsegmental" if pe_sub else "PE")
+            text = f"PE POSITIVE  ({tag})"
+        else:
+            banner = (30, 150, 80)
+            text = "PE NEGATIVE"
+        bh = 30
+        draw.rectangle((0, height - bh, width, height), fill=banner)
+        draw.text((pad, height - bh + 7), text, font=font_label, fill=(250, 250, 255))
+
+    return np.array(img, dtype=np.uint8)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Frame composition + video writing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compose_frame(ct_rgb: np.ndarray, panel_rgb: np.ndarray) -> np.ndarray:
+    """Concatenate CT slice and side panel side by side (same height)."""
+    h = ct_rgb.shape[0]
+    if panel_rgb.shape[0] != h:
+        pil = Image.fromarray(panel_rgb)
+        pil = pil.resize((panel_rgb.shape[1], h), Image.Resampling.LANCZOS)
+        panel_rgb = np.array(pil)
+    out = np.concatenate([ct_rgb, panel_rgb], axis=1)
+    H, W = out.shape[:2]
+    if W % 2:
+        out = out[:, :-1]
+    if H % 2:
+        out = out[:-1, :]
+    return out
+
+
+def write_mp4(frames: List[np.ndarray], out_path: Path, fps: int) -> None:
+    """Write RGB frames to an H.264 mp4 via ffmpeg piping."""
+    if not frames:
+        return
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    h, w = frames[0].shape[:2]
+    w2 = w - (w % 2)
+    h2 = h - (h % 2)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{w}x{h}", "-pix_fmt", "rgb24", "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-vf", f"scale={w2}:{h2}",
+        str(out_path),
+    ]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    try:
+        for f in frames:
+            if f.shape[:2] != (h, w):
+                pil = Image.fromarray(f)
+                pil = pil.resize((w, h), Image.Resampling.LANCZOS)
+                f = np.array(pil)
+            p.stdin.write(f.astype(np.uint8).tobytes())
+    finally:
+        p.stdin.close()
+        p.wait()
+
+
+def resize_square(rgb: np.ndarray, size: int) -> np.ndarray:
+    """Resize an RGB frame to size x size via PIL LANCZOS."""
+    pil = Image.fromarray(rgb)
+    pil = pil.resize((size, size), Image.Resampling.LANCZOS)
+    return np.array(pil)
