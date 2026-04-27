@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Generate M-100 INSPECT pulmonary embolism multimodal dataset.
+"""Generate M-100 VinDr-CXR chest abnormality detection dataset.
 
 Usage:
-    python examples/generate.py --num-samples 3
-    python examples/generate.py --num-samples 300 --output data/questions
-    python examples/generate.py            # uses default cap (300)
+    python examples/generate.py --num-samples 3        # local smoke test
+    python examples/generate.py --num-samples 800      # full EC2 run
+    python examples/generate.py                        # default cap = 800
 
-Bootstrap on EC2 calls this with --output /tmp/out (no --num-samples), so
-the default cap = 300 controls the EC2-side run length.
-
-Note: GitHub repo name still contains "vindrcxr" (do not rename — the website
-maps by repo prefix). The actual produced ``domain`` is ``inspect_pe_detection``,
-which appears as the on-disk task folder name and in the metadata.
+Bootstrap on EC2 calls this without --num-samples, so the argparse default
+(800) controls the EC2-side run length. Default is intentionally NOT 2 — the
+bootstrap 20-cap bug triggers on default<=2 (see HARNESS.md Part 11 / pitfalls).
 """
 import os
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -28,47 +25,43 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.pipeline import TaskPipeline, TaskConfig
+from src.pipeline import TaskConfig, TaskPipeline
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate M-100 INSPECT PE multimodal dataset"
+        description="Generate M-100 VinDr-CXR chest abnormality detection dataset",
     )
-    parser.add_argument("--num-samples", type=int, default=None,
-                        help="Cap on number of CT volumes to process (overrides --max-samples).")
+    parser.add_argument(
+        "--num-samples", type=int, default=800,
+        help="Cap on number of CXR images to render (default: 800).",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--generator", type=str, default=None)
     parser.add_argument("--output", type=str, default="data/questions")
-    parser.add_argument("--fps", type=int, default=8)
-    parser.add_argument("--num-frames", type=int, default=28)
-    parser.add_argument("--frame-height", type=int, default=512)
-    parser.add_argument("--ehr-panel-width", type=int, default=360)
-    parser.add_argument("--window-level", type=int, default=100)
-    parser.add_argument("--window-width", type=int, default=700)
+    parser.add_argument("--fps", type=int, default=12)
+    parser.add_argument("--num-frames", type=int, default=60)
+    parser.add_argument("--frame-size", type=int, default=512)
+    parser.add_argument("--bbox-alpha", type=float, default=0.35)
     parser.add_argument("--s3-bucket", type=str, default="med-vr-datasets")
+    parser.add_argument("--s3-prefix", type=str, default="M-100/VinDrCXR/")
     parser.add_argument(
-        "--s3-prefix", type=str,
-        default="M-100/inspect_pe/inspectamultimodaldatasetforpulmonaryembolismdiagnosisandprog-3/full/",
+        "--max-samples", type=int, default=800,
+        help="Hard cap (mirrors --num-samples; kept for backward compat).",
     )
-    parser.add_argument("--max-samples", type=int, default=300,
-                        help="EC2-default cap (300). Override with --num-samples for local smoke tests.")
     args = parser.parse_args()
 
-    print("Generating M-100 INSPECT pulmonary embolism multimodal dataset...", flush=True)
+    print("Generating M-100 VinDr-CXR chest abnormality detection dataset...",
+          flush=True)
 
     kwargs = dict(
         num_samples=args.num_samples,
         output_dir=Path(args.output),
-        seed=args.seed,
-        start_index=args.start_index,
         fps=args.fps,
         num_frames=args.num_frames,
-        frame_height=args.frame_height,
-        ehr_panel_width=args.ehr_panel_width,
-        window_level=args.window_level,
-        window_width=args.window_width,
+        frame_size=args.frame_size,
+        bbox_alpha=args.bbox_alpha,
         s3_bucket=args.s3_bucket,
         s3_prefix=args.s3_prefix,
         max_samples=args.max_samples,
