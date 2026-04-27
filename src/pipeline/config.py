@@ -1,16 +1,17 @@
-"""Pipeline configuration for M-100 INSPECT pulmonary embolism multimodal dataset.
+"""Pipeline configuration for M-100 VinDr-CXR chest abnormality detection.
 
-INSPECT (Stanford AIMI) is a multimodal PE dataset:
-    - CTPA volumes:     s3://med-vr-datasets/M-100/inspect_pe/.../full/CTPA/PE<id>.nii.gz
-    - EHR/labels TSVs:  s3://.../full/labels_20250611.tsv
-    - Impressions TSV:  s3://.../full/impressions_20250611.tsv
-    - Mapping TSV:      s3://.../full/study_mapping_20250611.tsv  (impression_id ↔ image_id)
+VinDr-CXR (Vietnamese chest X-ray) is a public dataset of frontal chest X-rays
+with bounding-box annotations for 14 thoracic abnormality classes plus a
+"No finding" class. This pipeline renders one VBVR sample per CXR with
+annotated bounding boxes (class-coloured) overlaid on the final frame.
 
-We mirror M-60 RadFusion (the sister PE multimodal dataset) for video construction.
+Raw layout under ``s3://med-vr-datasets/M-100/VinDrCXR/`` (HF mirror):
+    train/<image_id>.png         # 512x512 PNG chest X-rays
+    train.csv                    # image_id, class_name, class_id, rad_id, x_min, y_min, x_max, y_max
+    test/<image_id>.png          # (no labels)
 
-NOTE: GitHub repo name remains ``M-100_vindrcxr_chest_abnormality_detection_data-pipeline``
-(the website maps by repo prefix, so we do not rename), but the actual ``domain``
-(used for the on-disk task folder name) is the real INSPECT-style name.
+We use the train split (it has bbox labels). Multiple radiologists can box the
+same finding on one image — we union all bboxes per (image, class).
 """
 from pathlib import Path
 
@@ -20,35 +21,28 @@ from core.pipeline import PipelineConfig
 
 
 class TaskConfig(PipelineConfig):
-    """Dataset + rendering settings for INSPECT PE multimodal pipeline."""
+    """VinDr-CXR chest abnormality detection — frame + bbox-overlay rendering."""
 
-    domain: str = Field(default="inspect_pe_detection")
+    domain: str = Field(default="vindrcxr_chest_abnormality_detection")
 
     # Empty generator name → flat layout under data/questions/<domain>_task/<task_id>/
-    # which matches website / production S3 layout (avoids 7e/7m double-nesting).
+    # which matches website / production S3 layout.
     generator: str = Field(default="")
 
-    # Source layout in s3://med-vr-datasets/M-100/
+    # Source layout in s3://med-vr-datasets/M-100/VinDrCXR/
     s3_bucket: str = Field(default="med-vr-datasets")
-    s3_prefix: str = Field(
-        default="M-100/inspect_pe/inspectamultimodaldatasetforpulmonaryembolismdiagnosisandprog-3/full/"
-    )
+    s3_prefix: str = Field(default="M-100/VinDrCXR/")
     raw_dir: Path = Field(default=Path("raw"))
 
-    # CT windowing — mediastinal window highlights PE in pulmonary arteries.
-    window_level: int = Field(default=100)
-    window_width: int = Field(default=700)
+    # Video: synthesise 60-frame clips (≥60 to satisfy harness minimum) per sample.
+    fps: int = Field(default=12)
+    num_frames: int = Field(default=60)
 
-    # Video: axial sweep through the pulmonary-artery region.
-    fps: int = Field(default=8)
-    num_frames: int = Field(default=28)
+    # Frame output size (square, padded if needed).
+    frame_size: int = Field(default=512)
 
-    # Frame output size.
-    frame_height: int = Field(default=512)
-    ehr_panel_width: int = Field(default=360)
+    # Bbox overlay opacity for the bbox-reveal video.
+    bbox_alpha: float = Field(default=0.35)
 
-    # PE highlight (red, 40% opacity) on annotated video / final frame.
-    pe_alpha: float = Field(default=0.40)
-
-    # Default cap (overridden by --num-samples on the CLI).
-    max_samples: int = Field(default=300, ge=1)
+    # Default cap for EC2 runs (overridable via --num-samples).
+    max_samples: int = Field(default=800, ge=1)
